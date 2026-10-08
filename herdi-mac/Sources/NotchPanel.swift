@@ -289,6 +289,12 @@ final class PanelWindowController: NSObject, NSWindowDelegate, ObservableObject 
         panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
     }
 
+    /// Rebuild the view tree and window frame so every size is measured again. The Text Size
+    /// menu calls this after it stores a new scale, which is why the change shows without a relaunch.
+    func reloadLayout() {
+        handleScreenChange()
+    }
+
     private func handleScreenChange() {
         let screen = ScreenDetector.preferredScreen
         let contentView = makeHostingView(for: screen)

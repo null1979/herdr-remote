@@ -24,6 +24,8 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
         // Request notification permissions
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
+        UserDefaults.standard.register(defaults: [Self.scaleKey: Self.defaultScale])
+
         // Minimal status bar item (quit + show panel)
         setupStatusItem()
 
@@ -169,6 +171,8 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(paused)
         }
 
+        menu.addItem(textSizeItem())
+
         menu.addItem(.separator())
 
         // Launch at login
@@ -240,6 +244,66 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
     /// Repaint immediately rather than waiting up to a second for the next poll.
     private func refreshChrome() {
         applyStatusIcon(blocked: relay.agents.contains { $0.status == .blocked })
+        rebuildMenu()
+    }
+
+    // MARK: - Text size
+
+    private static let scaleKey = "herdi_ui_scale"
+    private static let defaultScale = 1.2
+    private static let scaleSteps: [Double] = stride(from: 1.0, through: 2.0, by: 0.1).map { ($0 * 10).rounded() / 10 }
+
+    private var currentScale: Double {
+        let stored = UserDefaults.standard.double(forKey: Self.scaleKey)
+        return stored > 0 ? (stored * 10).rounded() / 10 : Self.defaultScale
+    }
+
+    private func textSizeItem() -> NSMenuItem {
+        let scale = currentScale
+        let item = NSMenuItem(title: "Text Size: \(Int((scale * 100).rounded()))%", action: nil, keyEquivalent: "")
+        item.image = NSImage(systemSymbolName: "textformat.size", accessibilityDescription: nil)
+
+        let submenu = NSMenu()
+        let larger = NSMenuItem(title: "Larger", action: #selector(increaseTextSize), keyEquivalent: "=")
+        larger.target = self
+        submenu.addItem(larger)
+
+        let smaller = NSMenuItem(title: "Smaller", action: #selector(decreaseTextSize), keyEquivalent: "-")
+        smaller.target = self
+        submenu.addItem(smaller)
+
+        submenu.addItem(.separator())
+
+        for step in Self.scaleSteps {
+            let preset = NSMenuItem(title: "\(Int((step * 100).rounded()))%", action: #selector(selectTextSize(_:)), keyEquivalent: "")
+            preset.target = self
+            preset.representedObject = step
+            preset.state = step == scale ? .on : .off
+            submenu.addItem(preset)
+        }
+
+        item.submenu = submenu
+        return item
+    }
+
+    @objc private func increaseTextSize() {
+        guard let next = Self.scaleSteps.first(where: { $0 > currentScale }) else { return }
+        applyTextSize(next)
+    }
+
+    @objc private func decreaseTextSize() {
+        guard let previous = Self.scaleSteps.last(where: { $0 < currentScale }) else { return }
+        applyTextSize(previous)
+    }
+
+    @objc private func selectTextSize(_ sender: NSMenuItem) {
+        guard let step = sender.representedObject as? Double else { return }
+        applyTextSize(step)
+    }
+
+    private func applyTextSize(_ scale: Double) {
+        UserDefaults.standard.set(scale, forKey: Self.scaleKey)
+        panelController?.reloadLayout()
         rebuildMenu()
     }
 
