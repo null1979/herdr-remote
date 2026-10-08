@@ -66,9 +66,13 @@ struct NotchPanelView: View {
                         }
                     )
                     .frame(height: notchHeight)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: toggleFromBar)
                 } else {
                     IdleBar(relay: relay, notchHeight: notchHeight)
                         .frame(height: notchHeight)
+                        .contentShape(Rectangle())
+                        .onTapGesture(perform: toggleFromBar)
                 }
 
                 // Expanded content below notch
@@ -134,6 +138,25 @@ struct NotchPanelView: View {
             .transition(.blurFade.combined(with: .move(edge: .top)))
         case .collapsed:
             EmptyView()
+        }
+    }
+
+    // MARK: - Click Logic
+
+    /// A click on the bar opens the panel at once, or closes it when it is open. The hover timer
+    /// is cancelled either way, so a pending hover does not reopen what the click just closed.
+    private func toggleFromBar() {
+        hoverTimer?.invalidate()
+        switch controller.surface {
+        case .collapsed:
+            hoverPhase = .expanded
+            withAnimation(NotchAnimation.open) { controller.surface = .sessionList }
+        case .sessionList:
+            hoverPhase = .collapsed
+            withAnimation(NotchAnimation.close) { controller.surface = .collapsed }
+        case .approval(let agentId):
+            hoverPhase = .collapsed
+            controller.collapse(dismissing: agentId)
         }
     }
 
