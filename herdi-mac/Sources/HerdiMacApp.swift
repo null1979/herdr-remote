@@ -1,6 +1,7 @@
 import SwiftUI
 import ServiceManagement
 import UserNotifications
+import Carbon.HIToolbox
 
 @main
 struct HerdiApp: App {
@@ -15,6 +16,7 @@ struct HerdiApp: App {
 @MainActor
 class HerdiAppDelegate: NSObject, NSApplicationDelegate {
     var panelController: PanelWindowController?
+    private var cardShortcut: GlobalShortcut?
     let relay = RelayConnection()
     private var statusItem: NSStatusItem?
 
@@ -31,6 +33,11 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
 
         // Auto-expand when an agent gets blocked
         observeBlockedAgents()
+
+        // ⌃⌥H gives an open card the keyboard, for a card that opened while you typed elsewhere.
+        cardShortcut = GlobalShortcut(keyCode: kVK_ANSI_H, modifiers: controlKey | optionKey) { [weak self] in
+            MainActor.assumeIsolated { self?.panelController?.takeKeyboard(askedByShortcut: true) }
+        }
     }
 
     private func setupStatusItem() {
@@ -99,6 +106,21 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
         launchItem.state = UserDefaults.standard.bool(forKey: "launchAtLogin") ? .on : .off
         menu.addItem(launchItem)
 
+        let focusOn = UserDefaults.standard.bool(forKey: approvalFocusKey)
+        let focusItem = NSMenuItem(title: "Give Approvals Keyboard Focus", action: #selector(toggleApprovalFocus), keyEquivalent: "")
+        focusItem.target = self
+        focusItem.state = focusOn ? .on : .off
+        menu.addItem(focusItem)
+
+        if focusOn {
+            let typing = NSMenuItem(title: "Not while you are typing elsewhere", action: nil, keyEquivalent: "")
+            typing.isEnabled = false
+            menu.addItem(typing)
+        }
+        let shortcut = NSMenuItem(title: "⌃⌥H gives an open approval focus", action: nil, keyEquivalent: "")
+        shortcut.isEnabled = false
+        menu.addItem(shortcut)
+
         menu.addItem(.separator())
 
         // Update
@@ -144,6 +166,12 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    @objc private func toggleApprovalFocus() {
+        let current = UserDefaults.standard.bool(forKey: approvalFocusKey)
+        UserDefaults.standard.set(!current, forKey: approvalFocusKey)
+        rebuildMenu()
+    }
+
     @objc private func checkForUpdates() {
         Updater.shared.lastCheck = nil
         Updater.shared.checkForUpdates()
@@ -177,10 +205,38 @@ class HerdiAppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
 
-                // Auto-pop the approval card if panel is collapsed and there's a blocked agent
-                if let agent = blocked.first, self.panelController?.surface == .collapsed {
-                    withAnimation(NotchAnimation.pop) {
-                        self.panelController?.surface = .approval(agentId: agent.id)
+                if let controller = self.panelController {
+                    let blockedIds = Set(blocked.map(\.id))
+
+                    // An agent that has stopped asking should not leave its card on screen. This
+                    // is what strands people: the prompt gets answered in the terminal, the card
+                    // stays up showing output that has since moved on, and because approval cards
+                    // ignored both dismissal paths there was no way out of it.
+                    if case .approval(let shownId) = controller.surface, !blockedIds.contains(shownId) {
+                        controller.collapse(dismissing: nil)
+                        // The card leaves on its own, so say why: a VoiceOver user would otherwise
+                        // find it gone with no reason given.
+                        NSAccessibility.post(
+                            element: NSApp as Any,
+                            notification: .announcementRequested,
+                            userInfo: [
+                                .announcement: "Approval card closed. The agent is no longer waiting.",
+                                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+                            ]
+                        )
+                    }
+
+                    controller.dismissedBlocked.formIntersection(blockedIds)
+
+                    // Auto-pop for a blocked agent you have not already waved away. With
+                    // the setting on, the card also takes the keyboard, so the answer is one
+                    // shortcut away rather than a click first.
+                    if controller.surface == .collapsed,
+                       let agent = blocked.first(where: { !controller.dismissedBlocked.contains($0.id) }) {
+                        withAnimation(NotchAnimation.pop) {
+                            controller.surface = .approval(agentId: agent.id)
+                        }
+                        controller.takeKeyboard()
                     }
                 }
 

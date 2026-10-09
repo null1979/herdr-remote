@@ -109,11 +109,13 @@ struct NotchPanelView: View {
         switch controller.surface {
         case .approval(let agentId):
             if let agent = relay.agents.first(where: { $0.id == agentId }) {
-                ApprovalCard(agent: agent, relay: relay) {
-                    withAnimation(NotchAnimation.close) {
-                        controller.surface = .collapsed
-                    }
+                ApprovalCard(agent: agent, relay: relay) { answered in
+                    // An answered card is not "dismissed": the agent is about to stop being
+                    // blocked anyway, and marking it would suppress its next genuine prompt.
+                    controller.collapse(dismissing: answered ? nil : agent.id)
                 }
+                // A new prompt is a new card, with its own input guard. So is each opening.
+                .id("\(controller.cardOpenings)|\(agent.id)|\(agent.prompt ?? "")")
                 .transition(.blurFade.combined(with: .scale(scale: 0.96, anchor: .top)))
             }
         case .sessionList:
@@ -429,6 +431,11 @@ private struct AgentSessionRow: View {
     let style: RowStyle
     let relay: RelayConnection
     @State private var hovered = false
+    /// Off for the first second after a blocked row appears. A newly blocked agent moves to the
+    /// top of the list, which can put its Allow button under a pointer about to click.
+    @State private var allowArmed = false
+    /// The same guard for Interrupt, which a row that moves can also put under the pointer.
+    @State private var interruptArmed = false
 
     private var accentColor: Color {
         switch style {
@@ -482,13 +489,13 @@ private struct AgentSessionRow: View {
             // Actions
             if hovered || style == .blocked {
                 HStack(spacing: 4) {
-                    if style == .blocked,
-                       agent.options?.contains("yes, single permission") == true {
+                    if style == .blocked, let allow = allowOption(in: agent.options) {
                         Button {
+                            guard allowArmed else { return }
                             relay.send(response: ResponseMessage(
                                 pane_id: agent.id,
                                 prompt_id: agent.promptId,
-                                text: "yes, single permission"
+                                text: menuPayload(for: allow)
                             ))
                         } label: {
                             Image(systemName: "checkmark.circle.fill")
@@ -497,6 +504,7 @@ private struct AgentSessionRow: View {
                         }
                         .buttonStyle(.plain)
                         .help("Allow")
+                        .modifier(ArmAfterShown(armed: $allowArmed))
                     }
 
                     Button { relay.focusPane(agent.id) } label: {
@@ -508,13 +516,17 @@ private struct AgentSessionRow: View {
                     .help("Jump to terminal")
 
                     if style == .working || style == .blocked {
-                        Button { relay.interruptPane(agent.id) } label: {
+                        Button {
+                            guard interruptArmed else { return }
+                            relay.interruptPane(agent.id)
+                        } label: {
                             Image(systemName: "stop.circle")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.red.opacity(0.6))
                         }
                         .buttonStyle(.plain)
                         .help("Interrupt (^C)")
+                        .modifier(ArmAfterShown(armed: $interruptArmed))
                     }
                 }
                 .transition(.opacity)
@@ -541,14 +553,23 @@ private struct AgentSessionRow: View {
 private struct ApprovalCard: View {
     let agent: Agent
     let relay: RelayConnection
-    let onDismiss: () -> Void
+    /// true when the card was answered, false when it was waved away.
+    let onClose: (Bool) -> Void
     @State private var customResponse = ""
+    /// Off for the first second after the card is on screen. The card can open and take the
+    /// keyboard while you type in another app, or open under a pointer that is about to click
+    /// something else. Keys or clicks already on their way must not answer the prompt.
+    @State private var inputArmed = false
+    @FocusState private var replyFocused: Bool
+    /// The reply field stays off until a click on it. When the panel takes key, AppKit gives
+    /// focus to the first text field, so keys aimed at another app would land in it.
+    @State private var replyOpened = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             // Header
             HStack(spacing: 8) {
-                Button { onDismiss() } label: {
+                Button { onClose(false) } label: {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(.white.opacity(0.6))
@@ -570,12 +591,16 @@ private struct ApprovalCard: View {
 
                 Spacer()
 
-                Button { relay.interruptPane(agent.id) } label: {
+                Button {
+                    guard inputArmed else { return }
+                    relay.interruptPane(agent.id)
+                } label: {
                     Image(systemName: "stop.circle.fill")
                         .font(.system(size: 12))
                         .foregroundStyle(.red.opacity(0.7))
                 }
                 .buttonStyle(.plain)
+                .disabled(!inputArmed)
                 .help("Interrupt (^C)")
             }
             .padding(.horizontal, 14)
@@ -613,6 +638,7 @@ private struct ApprovalCard: View {
                 VStack(spacing: 6) {
                     ForEach(agent.multiOptions, id: \.self) { option in
                         Button {
+                            guard inputArmed else { return }
                             toggle(option, promptId: promptId)
                         } label: {
                             HStack {
@@ -623,16 +649,33 @@ private struct ApprovalCard: View {
                             .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.plain)
+                        .disabled(!inputArmed)
                     }
                     Button {
+                        guard inputArmed else { return }
                         submit(promptId: promptId)
                     } label: {
                         Label("Submit", systemImage: "checkmark.circle.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(!inputArmed)
                 }
                 .padding(.horizontal, 12)
+            } else if agent.options?.isEmpty ?? true {
+                if let menu = agent.choiceMenu {
+                    ChoiceButtons(menu: menu) { index in
+                        relay.sendKeys(keys(toChoose: index, in: menu), to: agent.id, expecting: menu)
+                        agent.status = .working
+                        agent.prompt = nil
+                        agent.choiceMenu = nil
+                        onClose(true)
+                    }
+                    .padding(.horizontal, 12)
+                } else {
+                    MenuKeyPad { key in relay.sendKeys([key], to: agent.id, shownPrompt: agent.prompt) }
+                        .padding(.horizontal, 12)
+                }
             } else {
                 ResponseButtonGrid(options: agent.options) { response in
                     respond(response)
@@ -656,7 +699,19 @@ private struct ApprovalCard: View {
                         RoundedRectangle(cornerRadius: 8)
                             .stroke(.white.opacity(0.1), lineWidth: 0.5)
                     )
-                    .onSubmit { if !customResponse.isEmpty { respond(customResponse) } }
+                    .disabled(!replyOpened)
+                    .focused($replyFocused)
+                    .overlay {
+                        if !replyOpened {
+                            Color.clear
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    replyOpened = true
+                                    DispatchQueue.main.async { replyFocused = true }
+                                }
+                        }
+                    }
+                    .onSubmit { if inputArmed, replyOpened, !customResponse.isEmpty { respond(customResponse) } }
 
                 Button { respond(customResponse) } label: {
                     Image(systemName: "arrow.up.circle.fill")
@@ -664,21 +719,25 @@ private struct ApprovalCard: View {
                         .foregroundStyle(customResponse.isEmpty ? .white.opacity(0.15) : .blue)
                 }
                 .buttonStyle(.plain)
-                .disabled(customResponse.isEmpty)
-                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(customResponse.isEmpty || !inputArmed)
+                .modifier(OptionalShortcut(key: inputArmed ? .return : nil, modifiers: .command))
             }
             .padding(.horizontal, 12)
             .padding(.bottom, 12)
         }
+        // Escape dismisses, the keyboard path to what the chevron and a click outside do.
+        .onExitCommand { onClose(false) }
+        .environment(\.inputArmed, inputArmed)
+        .modifier(ArmAfterShown(armed: $inputArmed))
     }
 
     private func respond(_ text: String) {
-        relay.send(response: ResponseMessage(pane_id: agent.id, prompt_id: agent.promptId, text: text))
+        relay.send(response: ResponseMessage(pane_id: agent.id, prompt_id: agent.promptId, text: menuPayload(for: text)))
         agent.status = .working
         agent.prompt = nil
         agent.promptId = nil
         agent.options = nil
-        onDismiss()
+        onClose(true)
     }
 
     private func toggle(_ option: String, promptId: String) {
@@ -697,21 +756,25 @@ private struct ApprovalCard: View {
         agent.promptId = nil
         agent.multiOptions = []
         agent.selectedOptions = []
-        onDismiss()
+        onClose(true)
     }
 }
 
 // MARK: - Response Button Grid
 
-/// Clean, icon-labeled buttons for common agent responses.
-/// Maps raw option strings to clear UI with icons and keyboard shortcuts.
+/// One button per option, in the agent's own words and in its order. Colour and icon say what an
+/// option does. The shortcut is the agent's own key with ⌘, from `optionShortcuts`.
 private struct ResponseButtonGrid: View {
     let options: [String]?
     let onRespond: (String) -> Void
 
     private var buttons: [ResponseAction] {
         guard let options else { return [] }
-        return options.map { mapOption($0) }
+        let bodies = options.map(optionBody)
+        let shortcuts = optionShortcuts(zip(options, bodies).map { option, body in
+            (label: body, number: Int(menuPayload(for: option)))
+        })
+        return options.indices.map { mapOption(options[$0], body: bodies[$0], shortcut: shortcuts[$0]) }
     }
 
     var body: some View {
@@ -722,49 +785,106 @@ private struct ResponseButtonGrid: View {
         }
     }
 
-    private func mapOption(_ option: String) -> ResponseAction {
-        let lower = option.lowercased()
-
-        // Permission responses
-        if lower.contains("single permission") || lower == "y" || lower == "yes" {
-            return ResponseAction(label: "Allow", icon: "checkmark", tint: .green, shortcut: "⌘Y", rawValue: option)
-        }
-        if lower.contains("always allow") || lower.contains("trust") {
-            return ResponseAction(label: "Trust", icon: "shield.checkered", tint: .blue, shortcut: "⌘T", rawValue: option)
-        }
-        if lower.contains("tab to edit") || lower.starts(with: "no") || lower == "n" {
-            return ResponseAction(label: "Deny", icon: "xmark", tint: .red, shortcut: "⌘N", rawValue: option)
-        }
-
-        // Batch responses
-        if lower.contains("approve all") {
-            return ResponseAction(label: "Approve All", icon: "checkmark.circle.fill", tint: .green, shortcut: "⌘A", rawValue: option)
-        }
-        if lower.contains("configure individually") {
-            return ResponseAction(label: "Configure", icon: "slider.horizontal.3", tint: .orange, shortcut: nil, rawValue: option)
-        }
-
-        // Flow control
-        if lower.contains("continue") || lower.contains("proceed") {
-            return ResponseAction(label: "Continue", icon: "play.fill", tint: .green, shortcut: "⌘↩", rawValue: option)
-        }
-        if lower.contains("edit") || lower.contains("modify") {
-            return ResponseAction(label: "Edit", icon: "pencil", tint: .orange, shortcut: "⌘E", rawValue: option)
-        }
-        if lower.contains("retry") || lower.contains("again") {
-            return ResponseAction(label: "Retry", icon: "arrow.clockwise", tint: .blue, shortcut: "⌘R", rawValue: option)
-        }
-        if lower.contains("skip") {
-            return ResponseAction(label: "Skip", icon: "forward.fill", tint: .gray, shortcut: nil, rawValue: option)
-        }
-        if lower.contains("exit") || lower.contains("cancel") || lower.contains("abort") {
-            return ResponseAction(label: "Cancel", icon: "xmark.circle", tint: .red, shortcut: "⌘.", rawValue: option)
-        }
-
-        // Fallback
-        let shortLabel = String(option.prefix(16))
-        return ResponseAction(label: shortLabel, icon: "circle", tint: .white.opacity(0.6), shortcut: nil, rawValue: option)
+    private func mapOption(_ option: String, body: String, shortcut: OptionShortcut?) -> ResponseAction {
+        let kind = optionKind(body)
+        return ResponseAction(
+            label: optionTitle(body), icon: kind.look.icon, tint: kind.look.tint,
+            shortcut: shortcut?.label, key: shortcut.map { KeyEquivalent($0.key) }, rawValue: option,
+            shifted: shortcut?.shift ?? false
+        )
     }
+}
+
+extension OptionShortcut {
+    /// The shortcut as the button prints it, such as ⌘P or ⌘⇧Y.
+    var label: String { "⌘" + (shift ? "⇧" : "") + String(key).uppercased() }
+}
+
+/// Colour and icon for each kind of option. The kind itself comes from `optionKind` in
+/// PromptScan.swift, where herdi-mac/test.sh can test it.
+extension OptionKind {
+
+    var look: (icon: String, tint: Color) {
+        switch self {
+        case .grant: ("shield.checkered", .blue)
+        case .once: ("checkmark", .green)
+        case .refuse: ("xmark", .red)
+        case .other: ("circle", .white.opacity(0.6))
+        }
+    }
+}
+
+/// One button per choice of a menu with no numbers, in the agent's words. The selected choice is
+/// outlined and VoiceOver hears "selected". Shortcuts follow the option buttons, from
+/// `optionShortcuts`. The menu has no numbers, so a choice that is not a yes or a no takes ⌘ and
+/// its position. A button presses the arrow keys from the selected choice to its own, then Enter.
+private struct ChoiceButtons: View {
+    let menu: ChoiceMenu
+    let onChoose: (Int) -> Void
+
+    private var actions: [ResponseAction] {
+        let shortcuts = optionShortcuts(menu.choices.enumerated().map { index, choice in
+            (label: choice, number: optionKind(choice) == .other ? index + 1 : nil)
+        })
+        return menu.choices.enumerated().map { index, choice in
+            let kind = optionKind(choice)
+            let shortcut = shortcuts[index]
+            return ResponseAction(
+                label: optionTitle(choice), icon: kind.look.icon, tint: kind.look.tint,
+                shortcut: shortcut?.label, key: shortcut.map { KeyEquivalent($0.key) }, rawValue: String(index),
+                shifted: shortcut?.shift ?? false, selected: index == menu.selected, detail: choice
+            )
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(actions) { action in
+                ResponseButton(action: action) { onChoose(Int(action.rawValue) ?? menu.selected) }
+            }
+        }
+    }
+}
+
+/// Keys for a menu Herdi cannot read at all. Every agent's menu answers to arrows, Enter and
+/// Escape, so these still work on a prompt Herdi has never seen. Each key shows its name and its
+/// shortcut, so the keyboard reaches all of them.
+private struct MenuKeyPad: View {
+    let onKey: (String) -> Void
+
+    private static let keys: [ResponseAction] = [
+        ResponseAction(label: "Up", icon: "arrow.up", tint: .white.opacity(0.85), shortcut: "⌘↑", key: .upArrow, rawValue: "Up"),
+        ResponseAction(label: "Down", icon: "arrow.down", tint: .white.opacity(0.85), shortcut: "⌘↓", key: .downArrow, rawValue: "Down"),
+        ResponseAction(label: "Left", icon: "arrow.left", tint: .white.opacity(0.85), shortcut: "⌘←", key: .leftArrow, rawValue: "Left"),
+        ResponseAction(label: "Right", icon: "arrow.right", tint: .white.opacity(0.85), shortcut: "⌘→", key: .rightArrow, rawValue: "Right"),
+        ResponseAction(label: "Select", icon: "return", tint: .white.opacity(0.85), shortcut: "⌘⇧↩", key: .return, rawValue: "Enter", shifted: true),
+        ResponseAction(label: "Esc", icon: "escape", tint: .white.opacity(0.85), shortcut: "⌘.", key: ".", rawValue: "Escape"),
+    ]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(Self.keys) { action in
+                ResponseButton(action: action) { onKey(action.rawValue) }
+            }
+        }
+    }
+}
+
+/// A parsed option arrives as "2. No". The agent's menu is driven by the number alone, so that
+/// is what gets typed; anything the parser did not produce is sent through untouched.
+private func menuPayload(for option: String) -> String {
+    guard let range = option.range(of: #"^\d{1,2}(?=[.):]\s)"#, options: .regularExpression) else { return option }
+    return String(option[range])
+}
+
+/// An option without the number the parser put in front of it.
+private func optionBody(_ option: String) -> String {
+    option.replacingOccurrences(of: #"^\d{1,2}[.):]\s*"#, with: "", options: .regularExpression)
+}
+
+/// The option meaning "go ahead, this once", if the agent offered one.
+private func allowOption(in options: [String]?) -> String? {
+    options?.first { optionKind(optionBody($0)) == .once }
 }
 
 private struct ResponseAction: Identifiable {
@@ -772,19 +892,29 @@ private struct ResponseAction: Identifiable {
     let icon: String
     let tint: Color
     let shortcut: String?
+    let key: KeyEquivalent?
     let rawValue: String
+    var shifted = false
+    /// Outlined, and read as "selected": the choice the agent's own cursor is on.
+    var selected = false
+    /// What VoiceOver and the tooltip give, when the raw value is not words.
+    var detail: String?
 
     var id: String { rawValue }
+
+    var modifiers: EventModifiers { shifted ? [.command, .shift] : .command }
 }
 
 private struct ResponseButton: View {
     let action: ResponseAction
     let onTap: () -> Void
+    @Environment(\.inputArmed) private var inputArmed
     @State private var hovered = false
     @State private var pressed = false
 
     var body: some View {
         Button {
+            guard inputArmed else { return }
             withAnimation(.easeOut(duration: 0.08)) { pressed = true }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 pressed = false
@@ -796,6 +926,8 @@ private struct ResponseButton: View {
                     .font(.system(size: 10, weight: .semibold))
                 Text(action.label)
                     .font(.system(size: 10, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 if let shortcut = action.shortcut {
                     Text(shortcut)
                         .font(.system(size: 8, weight: .medium))
@@ -812,14 +944,76 @@ private struct ResponseButton: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(action.tint.opacity(hovered ? 0.5 : 0.2), lineWidth: 0.5)
+                    .stroke(action.tint.opacity(action.selected ? 0.9 : hovered ? 0.5 : 0.2),
+                            lineWidth: action.selected ? 1.5 : 0.5)
             )
             .scaleEffect(pressed ? 0.95 : 1)
         }
         .buttonStyle(.plain)
+        // The visible label can be cut to 16 characters. VoiceOver and the tooltip get the whole
+        // option, so two options that start the same way do not sound or read the same.
+        .accessibilityLabel(action.label)
+        .accessibilityValue(action.selected ? "selected" : action.detail ?? action.rawValue)
+        .help(action.detail ?? action.rawValue)
+        .modifier(OptionalShortcut(key: inputArmed ? action.key : nil, modifiers: action.modifiers))
         .onHover { hovered = $0 }
         .animation(NotchAnimation.micro, value: hovered)
         .animation(.easeOut(duration: 0.08), value: pressed)
+    }
+}
+
+/// Whether the card's buttons and shortcuts answer yet. The approval card sets it, and every
+/// response button reads it, so no button type can skip the guard.
+private struct InputArmedKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+private extension EnvironmentValues {
+    var inputArmed: Bool {
+        get { self[InputArmedKey.self] }
+        set { self[InputArmedKey.self] = newValue }
+    }
+}
+
+/// Turns `armed` on one second after the view is on screen, and off again each time the panel
+/// comes back on screen. The panel can be hidden behind a full-screen app with a card already
+/// open, so the second must start when you can see the card, not when SwiftUI first draws it.
+/// Each restart gets a new generation, so a timer from an earlier start cannot arm this one.
+private struct ArmAfterShown: ViewModifier {
+    @Binding var armed: Bool
+    @State private var generation = 0
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear(perform: restart)
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
+                guard let window = note.object as? NSWindow, window is NSPanel else { return }
+                if window.occlusionState.contains(.visible) { restart() } else { armed = false }
+            }
+    }
+
+    private func restart() {
+        armed = false
+        generation += 1
+        let started = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            if generation == started { armed = true }
+        }
+    }
+}
+
+/// The shortcut printed on a response button only does anything if it is also bound.
+private struct OptionalShortcut: ViewModifier {
+    let key: KeyEquivalent?
+    let modifiers: EventModifiers
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let key {
+            content.keyboardShortcut(key, modifiers: modifiers)
+        } else {
+            content
+        }
     }
 }
 
