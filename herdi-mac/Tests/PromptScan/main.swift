@@ -129,5 +129,16 @@ check("sees that a new prompt replaced the one on the card",
 check("sees that the prompt is gone", !promptStillShown(excerpt, lines: ["$ "]))
 check("never matches a card with no prompt", !promptStillShown(nil, lines: question))
 
+check("keeps the keyboard off a card when the setting is off",
+      !mayTakeKeyboard(enabled: false, secondsSinceKeyDown: 60))
+check("gives a card the keyboard when the setting is on and nobody is typing",
+      mayTakeKeyboard(enabled: true, secondsSinceKeyDown: 2))
+check("keeps the keyboard off a card while you type in another app",
+      !mayTakeKeyboard(enabled: true, secondsSinceKeyDown: 1.9))
+check("gives a card the keyboard when you press the shortcut, with the setting off",
+      mayTakeKeyboard(enabled: false, secondsSinceKeyDown: 60, askedByShortcut: true))
+check("gives a card the keyboard when you press the shortcut, while you type",
+      mayTakeKeyboard(enabled: true, secondsSinceKeyDown: 0, askedByShortcut: true))
+
 print(failures == 0 ? "PromptScan tests passed" : "PromptScan tests: \(failures) failed")
 exit(failures == 0 ? 0 : 1)
